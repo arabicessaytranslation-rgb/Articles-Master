@@ -9,7 +9,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 
-# --- Scopes ---
+# --- الصلاحيات المطلوبة ---
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -17,8 +17,9 @@ SCOPES = [
 ]
 
 def get_google_services():
-    """Authenticate and return Google API service objects."""
+    """تهيئة الاتصال بخدمات جوجل باستخدام الأسرار (Secrets)"""
     creds_dict = json.loads(st.secrets["gcp_service_account"])
+    # إصلاح مشكلة الأسطر الجديدة في المفتاح السري
     creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     
@@ -29,12 +30,12 @@ def get_google_services():
     return gc, drive_service, docs_service
 
 def extract_folder_id(url):
-    """Extract Drive Folder ID from a standard URL."""
+    """استخراج المعرف (ID) من رابط جوجل درايف الذي يدخله السكرتير"""
     match = re.search(r'folders/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
 
 def get_or_create_folder(drive_service, parent_id, folder_name):
-    """Find a folder by name within a parent, or create it if missing."""
+    """البحث عن مجلد، وإنشاؤه إن لم يكن موجوداً لمنع التكرار"""
     query = f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
     
@@ -50,7 +51,7 @@ def get_or_create_folder(drive_service, parent_id, folder_name):
         return new_folder.get('id')
 
 def count_words(docs_service, document_id):
-    """Calculate word count for a Google Doc."""
+    """حساب عدد الكلمات من مستند جوجل"""
     try:
         doc = docs_service.documents().get(documentId=document_id).execute()
         text = "".join([
@@ -63,10 +64,10 @@ def count_words(docs_service, document_id):
         return "N/A"
 
 def send_notification_email(table_data):
-    """Dispatch structured HTML email to the team."""
+    """إرسال إيميل التنبيه للفريق"""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
-    receiver = "team_email@example.com"  # Update with your actual team/secretary email
+    receiver = "team_email@example.com"  # ضع إيميل الفريق هنا
 
     msg = MIMEMultipart("alternative")
     msg['Subject'] = "تحديث: مقالات جديدة جاهزة للترجمة"
@@ -105,12 +106,12 @@ def send_notification_email(table_data):
     server.quit()
 
 def process_articles(coordinator_folder_id, selected_month, selected_year):
-    """Main pipeline execution."""
+    """محرك العمل الرئيسي (The Robot)"""
     gc, drive_service, docs_service = get_google_services()
     root_folder_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
     sheet_id = st.secrets["SHEET_ID"]
     
-    # 1. Fetch files from coordinator
+    # 1. جلب الملفات من المنسق
     results = drive_service.files().list(
         q=f"'{coordinator_folder_id}' in parents and trashed = false", 
         fields="files(id, name)"
@@ -120,7 +121,7 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
     if not source_files:
         return None, "لا توجد ملفات في مجلد المنسق."
 
-    # 2. Build Year and Month Hierarchy
+    # 2. بناء مجلد السنة والشهر
     year_folder_name = f"{selected_year} Edition"
     month_name = datetime.date(selected_year, selected_month, 1).strftime('%B')
     month_folder_name = f"{selected_month:02d} - {month_name} {selected_year}"
@@ -128,34 +129,34 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
     year_folder_id = get_or_create_folder(drive_service, root_folder_id, year_folder_name)
     month_folder_id = get_or_create_folder(drive_service, year_folder_id, month_folder_name)
 
-    # 3. Setup Sheet Data
+    # 3. إعداد الشيت
     sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
     existing_data = sheet.get_all_values()
     table_data = existing_data if existing_data else [["عنوان المقال", "عدد الكلمات", "رابط مجلد العمل"]]
     
     processed_any = False
 
-    # 4. Process each file
+    # 4. معالجة كل ملف
     for file in source_files:
         file_name = file['name'].replace('.docx', '')
         
-        # Check if article folder already exists to prevent duplicates
+        # التأكد من عدم تكرار سحب المقال
         query = f"'{month_folder_id}' in parents and name = '{file_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         existing_article = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
         
         if not existing_article:
             processed_any = True
             
-            # Create Article Master Folder
+            # إنشاء مجلد المقال
             article_folder_id = get_or_create_folder(drive_service, month_folder_id, file_name)
             
-            # Create the 4 Stage Subfolders
+            # إنشاء المجلدات الفرعية الأربعة
             stage0_id = get_or_create_folder(drive_service, article_folder_id, "00- المادة الأصلية (السكرتير)")
             get_or_create_folder(drive_service, article_folder_id, "01- ترجمة المقالات (المترجمون)")
             get_or_create_folder(drive_service, article_folder_id, "02- تدقيق الترجمة (مدققو الترجمة)")
             get_or_create_folder(drive_service, article_folder_id, "03- تسجيل المقالات (المسجلون)")
             
-            # Copy file to Stage 00
+            # نسخ الملف للمرحلة صفر
             copied_file = {'parents': [stage0_id]}
             copy_result = drive_service.files().copy(
                 fileId=file['id'], 
@@ -173,12 +174,13 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
         try:
             send_notification_email(table_data)
         except Exception as e:
-            return None, f"تمت المعالجة لكن فشل إرسال الإيميل: {e}"
+            return None, f"تمت المعالجة بنجاح، لكن فشل إرسال الإيميل: {e}"
         return table_data, "تم سحب المقالات، بناء المجلدات، وتحديث الشيت بنجاح."
     else:
         return None, "جميع المقالات موجودة مسبقاً، لم يتم إضافة جديد."
 
-# --- Streamlit UI ---
+# --- واجهة المستخدم (Streamlit Frontend) ---
+st.set_page_config(page_title="بوابة استلام المقالات", page_icon="📝")
 st.title("بوابة استلام مقالات الترجمة")
 
 coordinator_url = st.text_input("رابط مجلد المنسق (Google Drive):")
@@ -186,10 +188,12 @@ coordinator_url = st.text_input("رابط مجلد المنسق (Google Drive):"
 col1, col2 = st.columns(2)
 with col1:
     months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
+    # افتراضياً يختار الشهر الحالي
     selected_month_name = st.selectbox("شهر الإصدار:", months, index=datetime.datetime.now().month - 1)
     selected_month_num = months.index(selected_month_name) + 1
 with col2:
     current_year = datetime.datetime.now().year
+    # يعرض السنة الحالية والسنوات القادمة
     selected_year = st.selectbox("سنة الإصدار:", range(current_year - 1, current_year + 5), index=1)
 
 if st.button("سحب المقالات وبدء العمل"):
@@ -205,7 +209,7 @@ if st.button("سحب المقالات وبدء العمل"):
                     data, msg = process_articles(source_folder_id, selected_month_num, selected_year)
                     if data:
                         st.success(msg)
-                        st.balloons()
+                        st.balloons() # احتفال بنجاح العملية
                     else:
                         st.info(msg)
                 except Exception as e:
