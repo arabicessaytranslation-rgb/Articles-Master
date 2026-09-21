@@ -6,7 +6,7 @@ from email.mime.multipart import MIMEMultipart
 import re
 import json
 import gspread
-from google.oauth2.service_account import Credentials
+from google.oauth2.credentials import Credentials  # تم تغيير هذا السطر
 from googleapiclient.discovery import build
 
 # --- الصلاحيات المطلوبة ---
@@ -17,17 +17,18 @@ SCOPES = [
 ]
 
 def get_google_services():
-    """تهيئة الاتصال بخدمات جوجل باستخدام الأسرار (Secrets)"""
-    creds_dict = json.loads(st.secrets["gcp_service_account"])
-    # إصلاح مشكلة الأسطر الجديدة في المفتاح السري
-    creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    """تهيئة الاتصال بخدمات جوجل باستخدام مفتاح OAuth الشخصي"""
+    creds_dict = json.loads(st.secrets["gcp_oauth_token"])
+    # استخدام المفتاح الشخصي بدلاً من حساب الخدمة
+    creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
     
     gc = gspread.authorize(creds)
     drive_service = build('drive', 'v3', credentials=creds)
     docs_service = build('docs', 'v1', credentials=creds)
     
     return gc, drive_service, docs_service
+
+# ... (باقي الكود كما هو بدون أي تغيير بدءاً من دالة extract_folder_id) ...
 
 def extract_folder_id(url):
     """استخراج المعرف (ID) من رابط جوجل درايف الذي يدخله السكرتير"""
