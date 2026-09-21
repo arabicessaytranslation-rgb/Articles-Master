@@ -71,7 +71,7 @@ def send_notification_email(table_data):
     """إرسال إيميل التنبيه للفريق"""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
-    receiver = "team_email@example.com"  # ضع إيميل الفريق أو السكرتير هنا
+    receiver = "arabicessaytranslation@gmail.com"  # ضع إيميل الفريق أو السكرتير هنا
 
     msg = MIMEMultipart("alternative")
     msg['Subject'] = "تحديث: مقالات جديدة جاهزة للترجمة"
