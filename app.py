@@ -35,15 +35,18 @@ def extract_folder_id(url):
     return match.group(1) if match else None
 
 def get_or_create_folder(drive_service, parent_id, folder_name):
-    """البحث عن مجلد، وإنشاؤه إن لم يكن موجوداً لمنع التكرار"""
-    query = f"'{parent_id}' in parents and name = '{folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+    """البحث عن مجلد، وإنشاؤه إن لم يكن موجوداً لمنع التكرار (مع معالجة الفواصل العليا)"""
+    # حماية الاسم من الفواصل العليا المسببة لأخطاء البحث في جوجل درايف
+    safe_folder_name = folder_name.replace("'", "\\'")
+    
+    query = f"'{parent_id}' in parents and name = '{safe_folder_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     results = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
     
     if results:
         return results[0]['id']
     else:
         metadata = {
-            'name': folder_name,
+            'name': folder_name, # عند الإنشاء نستخدم الاسم الأصلي بدون تعديل
             'mimeType': 'application/vnd.google-apps.folder',
             'parents': [parent_id]
         }
@@ -61,13 +64,13 @@ def count_words(docs_service, document_id):
         ])
         return len(text.split())
     except Exception:
-        return "N/A"
+        return "N/A" # في حال كان الملف ليس Google Doc قابل للقراءة
 
 def send_notification_email(table_data):
     """إرسال إيميل التنبيه للفريق"""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
-    receiver = "team_email@example.com"  # ضع إيميل الفريق هنا
+    receiver = "team_email@example.com"  # ضع إيميل الفريق أو السكرتير هنا
 
     msg = MIMEMultipart("alternative")
     msg['Subject'] = "تحديث: مقالات جديدة جاهزة للترجمة"
@@ -111,7 +114,7 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
     root_folder_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
     sheet_id = st.secrets["SHEET_ID"]
     
-    # 1. جلب الملفات من المنسق
+    # 1. جلب الملفات من مجلد المنسق
     results = drive_service.files().list(
         q=f"'{coordinator_folder_id}' in parents and trashed = false", 
         fields="files(id, name)"
@@ -129,34 +132,35 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
     year_folder_id = get_or_create_folder(drive_service, root_folder_id, year_folder_name)
     month_folder_id = get_or_create_folder(drive_service, year_folder_id, month_folder_name)
 
-    # 3. إعداد الشيت
+    # 3. إعداد ملف الإكسل
     sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
     existing_data = sheet.get_all_values()
     table_data = existing_data if existing_data else [["عنوان المقال", "عدد الكلمات", "رابط مجلد العمل"]]
     
     processed_any = False
 
-    # 4. معالجة كل ملف
+    # 4. معالجة كل ملف في مجلد المنسق
     for file in source_files:
         file_name = file['name'].replace('.docx', '')
         
-        # التأكد من عدم تكرار سحب المقال
-        query = f"'{month_folder_id}' in parents and name = '{file_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
+        # التأكد من عدم تكرار سحب المقال (مع حماية الفواصل العليا)
+        safe_file_name = file_name.replace("'", "\\'")
+        query = f"'{month_folder_id}' in parents and name = '{safe_file_name}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
         existing_article = drive_service.files().list(q=query, fields="files(id)").execute().get('files', [])
         
         if not existing_article:
             processed_any = True
             
-            # إنشاء مجلد المقال
+            # أ. إنشاء المجلد الرئيسي للمقال
             article_folder_id = get_or_create_folder(drive_service, month_folder_id, file_name)
             
-            # إنشاء المجلدات الفرعية الأربعة
+            # ب. إنشاء المجلدات الفرعية الأربعة داخل المقال
             stage0_id = get_or_create_folder(drive_service, article_folder_id, "00- المادة الأصلية (السكرتير)")
             get_or_create_folder(drive_service, article_folder_id, "01- ترجمة المقالات (المترجمون)")
             get_or_create_folder(drive_service, article_folder_id, "02- تدقيق الترجمة (مدققو الترجمة)")
             get_or_create_folder(drive_service, article_folder_id, "03- تسجيل المقالات (المسجلون)")
             
-            # نسخ الملف للمرحلة صفر
+            # ج. نسخ الملف الأصلي ووضعه في مجلد المرحلة صفر
             copied_file = {'parents': [stage0_id]}
             copy_result = drive_service.files().copy(
                 fileId=file['id'], 
@@ -164,27 +168,33 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
                 fields="id"
             ).execute()
             
+            # د. جلب رابط المجلد وحساب الكلمات للتسجيل في الإكسل
             folder_link = f"https://drive.google.com/drive/folders/{article_folder_id}"
             word_count = count_words(docs_service, copy_result['id'])
             table_data.append([file_name, word_count, folder_link])
 
     if processed_any:
+        # مسح الإكسل وكتابة الجدول المحدث بالكامل
         sheet.clear()
         sheet.update(range_name='A1', values=table_data)
         try:
             send_notification_email(table_data)
         except Exception as e:
-            return None, f"تمت المعالجة بنجاح، لكن فشل إرسال الإيميل: {e}"
-        return table_data, "تم سحب المقالات، بناء المجلدات، وتحديث الشيت بنجاح."
+            return None, f"تمت المعالجة بنجاح، لكن فشل إرسال الإيميل بسبب: {e}"
+        return table_data, "تم سحب المقالات، بناء المجلدات، وتحديث الشيت وإرسال التنبيه بنجاح."
     else:
-        return None, "جميع المقالات موجودة مسبقاً، لم يتم إضافة جديد."
+        return None, "جميع المقالات في هذا الرابط موجودة مسبقاً، لم يتم إضافة أي جديد."
 
-# --- واجهة المستخدم (Streamlit Frontend) ---
+# ==========================================
+# واجهة المستخدم (Streamlit Frontend)
+# ==========================================
 st.set_page_config(page_title="بوابة استلام المقالات", page_icon="📝")
 st.title("بوابة استلام مقالات الترجمة")
 
+# حقل إدخال الرابط
 coordinator_url = st.text_input("رابط مجلد المنسق (Google Drive):")
 
+# خيارات الشهر والسنة
 col1, col2 = st.columns(2)
 with col1:
     months = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"]
@@ -196,15 +206,16 @@ with col2:
     # يعرض السنة الحالية والسنوات القادمة
     selected_year = st.selectbox("سنة الإصدار:", range(current_year - 1, current_year + 5), index=1)
 
+# زر التشغيل الرئيسي
 if st.button("سحب المقالات وبدء العمل"):
     if not coordinator_url:
         st.warning("يرجى إدخال رابط المنسق أولاً.")
     else:
         source_folder_id = extract_folder_id(coordinator_url)
         if not source_folder_id:
-            st.error("الرابط غير صحيح. تأكد من أنه رابط مجلد جوجل درايف.")
+            st.error("الرابط غير صحيح. تأكد من أنه رابط مجلد جوجل درايف يحتوي على 'folders/ID'.")
         else:
-            with st.spinner("جاري معالجة الملفات وبناء هيكل المجلدات..."):
+            with st.spinner("جاري معالجة الملفات وبناء هيكل المجلدات... يرجى الانتظار."):
                 try:
                     data, msg = process_articles(source_folder_id, selected_month_num, selected_year)
                     if data:
