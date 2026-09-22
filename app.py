@@ -10,7 +10,7 @@ import gspread
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
-# --- Scopes ---
+# --- Google API Scopes ---
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
@@ -34,12 +34,12 @@ def extract_folder_id(url):
     return match.group(1) if match else None
 
 def normalize_string(val):
-    """Normalizes string for comparison: removes punctuation, trims extra whitespace, lowercases."""
+    """Cleans and standardizes text for fuzzy matching."""
     val = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s]', ' ', val)
     return re.sub(r'\s+', ' ', val).strip().lower()
 
 def list_subfolders(drive_service, parent_id):
-    """Retrieves all non-trashed subfolders directly inside a parent folder."""
+    """Lists non-trashed subfolders inside a specific parent folder."""
     query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     response = drive_service.files().list(
         q=query,
@@ -50,86 +50,73 @@ def list_subfolders(drive_service, parent_id):
     ).execute()
     return response.get('files', [])
 
-def resolve_year_folder(drive_service, root_folder_id, target_year):
+def detect_existing_folders(drive_service, root_folder_id, target_year, target_month_num):
     """
-    Finds existing year folder by numeric anchor (e.g., '2026', '2026 Edition', 'Edition 2026').
-    Creates one standard folder if not found.
+    Checks if Year and Month folders already exist (exact or similar).
+    Returns inspection metadata without creating or modifying anything.
     """
-    subfolders = list_subfolders(drive_service, root_folder_id)
+    # 1. Inspect Year Folder
+    year_folders = list_subfolders(drive_service, root_folder_id)
     year_str = str(target_year)
-    standard_name = f"{target_year} Edition"
+    matched_year = None
 
-    # Match by year number anchor
-    for folder in subfolders:
+    for folder in year_folders:
         tokens = re.findall(r'\b\d{4}\b', folder['name'])
         if year_str in tokens or year_str in folder['name']:
-            return folder['id']
+            matched_year = folder
+            break
 
-    # Fallback to string similarity if no strict regex match
-    for folder in subfolders:
-        sim = SequenceMatcher(None, normalize_string(standard_name), normalize_string(folder['name'])).ratio()
-        if sim >= 0.70:
-            return folder['id']
+    if not matched_year:
+        for folder in year_folders:
+            sim = SequenceMatcher(None, normalize_string(f"{target_year} Edition"), normalize_string(folder['name'])).ratio()
+            if sim >= 0.70:
+                matched_year = folder
+                break
 
-    # Create standard folder if completely missing
-    metadata = {
-        'name': standard_name,
-        'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [root_folder_id]
+    # 2. Inspect Month Folder if Year folder exists
+    matched_month = None
+    if matched_year:
+        month_folders = list_subfolders(drive_service, matched_year['id'])
+        month_date = datetime.date(target_year, target_month_num, 1)
+        full_name = month_date.strftime('%B')
+        short_name = month_date.strftime('%b')
+        target_num_str = str(target_month_num)
+        target_num_padded = f"{target_month_num:02d}"
+
+        highest_score = 0.0
+        for folder in month_folders:
+            name_clean = normalize_string(folder['name'])
+            tokens = name_clean.split()
+            
+            has_name = (full_name.lower() in name_clean) or (short_name.lower() in tokens)
+            nums = re.findall(r'\b\d{1,2}\b', folder['name'])
+            has_num = (target_num_str in nums) or (target_num_padded in nums)
+
+            if has_name or has_num:
+                sim = SequenceMatcher(None, normalize_string(f"{target_num_padded} - {full_name} {target_year}"), name_clean).ratio()
+                if sim > highest_score:
+                    highest_score = sim
+                    matched_month = folder
+
+    return {
+        "year_exists": matched_year is not None,
+        "year_folder": matched_year,
+        "month_exists": matched_month is not None,
+        "month_folder": matched_month
     }
-    created = drive_service.files().create(body=metadata, fields='id', supportsAllDrives=True).execute()
-    return created.get('id')
 
-def resolve_month_folder(drive_service, year_folder_id, target_month_num, target_year):
-    """
-    Finds existing month folder under the year folder.
-    Matches against: full month name, 3-letter abbreviation, and 1- or 2-digit numeric representations.
-    Creates a standardized folder if not found.
-    """
-    subfolders = list_subfolders(drive_service, year_folder_id)
-    
-    month_date = datetime.date(target_year, target_month_num, 1)
-    full_name = month_date.strftime('%B')        # e.g., "October"
-    short_name = month_date.strftime('%b')       # e.g., "Oct"
-    standard_name = f"{target_month_num:02d} - {full_name} {target_year}"
-
-    target_num_str = str(target_month_num)
-    target_num_padded = f"{target_month_num:02d}"
-
-    best_match_id = None
-    highest_score = 0.0
-
-    for folder in subfolders:
-        name_clean = normalize_string(folder['name'])
-        tokens = name_clean.split()
-
-        # 1. Check direct name anchor (e.g., "october" or "oct")
-        has_name_anchor = (full_name.lower() in name_clean) or (short_name.lower() in tokens)
-
-        # 2. Check numeric anchor (e.g., isolated "10" or "09")
-        folder_numbers = re.findall(r'\b\d{1,2}\b', folder['name'])
-        has_number_anchor = (target_num_str in folder_numbers) or (target_num_padded in folder_numbers)
-
-        if has_name_anchor or has_number_anchor:
-            sim = SequenceMatcher(None, normalize_string(standard_name), name_clean).ratio()
-            if sim > highest_score:
-                highest_score = sim
-                best_match_id = folder['id']
-
-    if best_match_id and highest_score >= 0.35:
-        return best_match_id
-
-    # Create standard folder if completely missing
+def get_or_create_folder(drive_service, parent_id, folder_name):
+    """Creates a folder under parent if not already passed directly."""
     metadata = {
-        'name': standard_name,
+        'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder',
-        'parents': [year_folder_id]
+        'parents': [parent_id]
     }
     created = drive_service.files().create(body=metadata, fields='id', supportsAllDrives=True).execute()
     return created.get('id')
 
 def count_words(docs_service, document_id):
-    """Counts words directly from the Google Document body."""
+    """Counts words from a Google Doc body."""
     try:
         doc = docs_service.documents().get(documentId=document_id).execute()
         text = "".join([
@@ -142,7 +129,7 @@ def count_words(docs_service, document_id):
         return "N/A"
 
 def send_notification_email(table_data):
-    """Sends notification email to team recipients with direct document links."""
+    """Sends notification email to specified team recipients."""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
     
@@ -190,13 +177,12 @@ def send_notification_email(table_data):
     server.sendmail(sender, recipients, msg.as_string())
     server.quit()
 
-def process_articles(coordinator_folder_id, selected_month, selected_year):
-    """Processes source folder files directly into the resolved year/month folders."""
+def execute_article_transfer(coordinator_folder_id, month_folder_id):
+    """Transfers articles into the designated month folder and updates tracking."""
     gc, drive_service, docs_service = get_google_services()
-    root_folder_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
     sheet_id = st.secrets["SHEET_ID"]
 
-    # 1. Fetch source files from coordinator's folder
+    # 1. Fetch source files from coordinator folder
     query_source = f"'{coordinator_folder_id}' in parents and trashed = false and mimeType != 'application/vnd.google-apps.folder'"
     source_files_res = drive_service.files().list(
         q=query_source,
@@ -209,32 +195,27 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
     if not source_files:
         return None, "لا توجد ملفات داخل مجلد المنسق."
 
-    # 2. Resolve Year and Month folders (detects existing variations before creating)
-    year_folder_id = resolve_year_folder(drive_service, root_folder_id, selected_year)
-    month_folder_id = resolve_month_folder(drive_service, year_folder_id, selected_month, selected_year)
-
-    # 3. Read files already inside month folder to avoid duplicates
-    query_month_files = f"'{month_folder_id}' in parents and trashed = false"
-    month_files_res = drive_service.files().list(
-        q=query_month_files,
+    # 2. Check files already inside destination folder to prevent duplicates
+    query_dest = f"'{month_folder_id}' in parents and trashed = false"
+    dest_files_res = drive_service.files().list(
+        q=query_dest,
         fields="files(id, name)",
         supportsAllDrives=True,
         includeItemsFromAllDrives=True
     ).execute()
-    existing_file_names = {f['name'].strip().lower() for f in month_files_res.get('files', [])}
+    existing_dest_names = {f['name'].strip().lower() for f in dest_files_res.get('files', [])}
 
-    # 4. Read Sheet tracking state
+    # 3. Read Sheet tracking state
     sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
     existing_sheet_data = sheet.get_all_values()
     table_data = existing_sheet_data if existing_sheet_data else [["عنوان المقال", "عدد الكلمات", "رابط المستند"]]
 
     processed_count = 0
 
-    # 5. Copy files directly into month folder
+    # 4. Copy each file directly into the designated month folder
     for file in source_files:
         file_name = file['name']
-
-        if file_name.strip().lower() in existing_file_names:
+        if file_name.strip().lower() in existing_dest_names:
             continue
 
         copy_meta = {
@@ -253,10 +234,10 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
         word_count = count_words(docs_service, doc_id)
 
         table_data.append([file_name, word_count, doc_url])
-        existing_file_names.add(file_name.strip().lower())
+        existing_dest_names.add(file_name.strip().lower())
         processed_count += 1
 
-    # 6. Update Tracker Sheet and dispatch notifications
+    # 5. Save updates and send emails
     if processed_count > 0:
         sheet.clear()
         sheet.update(range_name='A1', values=table_data)
@@ -264,15 +245,18 @@ def process_articles(coordinator_folder_id, selected_month, selected_year):
             send_notification_email(table_data)
         except Exception as e:
             return table_data, f"تم نسخ {processed_count} ملف بنجاح، لكن تعذر إرسال الإيميل: {e}"
-        return table_data, f"تم بنجاح نسخ {processed_count} مقال إلى مجلد الشهر وتحديث جدول المتابعة والإيميل."
+        return table_data, f"تم بنجاح نقل ونسخ {processed_count} مقال إلى المجلد، وتحديث جدول التتبع والإيميل."
     else:
-        return None, "جميع الملفات الموجودة في رابط المنسق موجودة بالفعل داخل مجلد الشهر."
+        return None, "جميع الملفات الموجودة في رابط المنسق موجودة مسبقاً داخل هذا المجلد."
 
 # ==========================================
-# Streamlit UI
+# Streamlit UI with Interactive State
 # ==========================================
 st.set_page_config(page_title="بوابة استلام المقالات", page_icon="📂", layout="centered")
 st.title("بوابة استلام مقالات الترجمة")
+
+if "folder_action" not in st.session_state:
+    st.session_state.folder_action = None
 
 coordinator_url = st.text_input("رابط مجلد المنسق (Google Drive):")
 
@@ -289,21 +273,106 @@ with col2:
     current_year = datetime.datetime.now().year
     selected_year = st.selectbox("سنة الإصدار:", range(current_year - 1, current_year + 5), index=1)
 
-if st.button("سحب المقالات وبدء العمل"):
+# Main trigger: Pre-flight inspection
+if st.button("فحص واستيراد المقالات"):
     if not coordinator_url:
         st.warning("يرجى إدخال رابط المنسق أولاً.")
     else:
         source_folder_id = extract_folder_id(coordinator_url)
         if not source_folder_id:
-            st.error("الرابط غير صحيح. تأكد من إدخال رابط صالح لمجلد Google Drive يحتوي على 'folders/ID'.")
+            st.error("الرابط غير صحيح. تأكد من إدخال رابط مجلد Google Drive صالح.")
         else:
-            with st.spinner("جاري فحص المجلدات واستيراد المقالات..."):
+            with st.spinner("جاري فحص المجلدات في Google Drive..."):
                 try:
-                    data, msg = process_articles(source_folder_id, selected_month_num, selected_year)
-                    if data:
-                        st.success(msg)
-                        st.balloons()
-                    else:
-                        st.info(msg)
+                    gc, drive_service, docs_service = get_google_services()
+                    root_folder_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
+                    
+                    inspection = detect_existing_folders(drive_service, root_folder_id, selected_year, selected_month_num)
+                    
+                    # Store inspection findings in session state
+                    st.session_state.folder_action = {
+                        "source_folder_id": source_folder_id,
+                        "selected_year": selected_year,
+                        "selected_month_num": selected_month_num,
+                        "selected_month_name": selected_month_name,
+                        "inspection": inspection
+                    }
                 except Exception as e:
-                    st.error(f"حدث خطأ أثناء التشغيل: {e}")
+                    st.error(f"خطأ أثناء فحص المجلدات: {e}")
+
+# Confirmation Dialog Block (Shown if a folder exists or needs confirmation)
+if st.session_state.folder_action:
+    action_data = st.session_state.folder_action
+    insp = action_data["inspection"]
+    source_id = action_data["source_folder_id"]
+    year = action_data["selected_year"]
+    month_num = action_data["selected_month_num"]
+    month_name = action_data["selected_month_name"]
+
+    st.markdown("---")
+    
+    if insp["month_exists"]:
+        found_name = insp["month_folder"]["name"]
+        year_name = insp["year_folder"]["name"]
+        
+        st.warning(f"⚠️ **تنبيه:** تم العثور على مجلد مطابق/مشابه بالفعل:\n\n- المجلد: **`{found_name}`**\n- داخل: **`{year_name}`**")
+        st.info("هل تود الاستمرار واستيراد المقالات إلى هذا المجلد الموجود مسبقاً؟")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ نعم، استمر واعتمد هذا المجلد"):
+                with st.spinner("جاري نسخ الملفات وتحديث النظام..."):
+                    try:
+                        data, msg = execute_article_transfer(source_id, insp["month_folder"]["id"])
+                        st.session_state.folder_action = None
+                        if data:
+                            st.success(msg)
+                            st.balloons()
+                        else:
+                            st.info(msg)
+                    except Exception as e:
+                        st.error(f"حدث خطأ أثناء النقل: {e}")
+
+        with c2:
+            if st.button("❌ إلغاء العملية"):
+                st.session_state.folder_action = None
+                st.rerun()
+
+    else:
+        # Case: Month folder does not exist
+        st.info(f"لم يتم العثور على مجلد سابق لشهر **{month_name} {year}**.")
+        st.write(f"سيتم إنشاء مجلد جديد باسم: **`{month_num:02d} - {month_name} {year}`**")
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("✅ تأكيد إنشاء المجلد وبدء النقل"):
+                with st.spinner("جاري إنشاء المجلد ونقل المقالات..."):
+                    try:
+                        gc, drive_service, docs_service = get_google_services()
+                        root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
+                        
+                        # Resolve year folder ID or create it
+                        if insp["year_exists"]:
+                            year_id = insp["year_folder"]["id"]
+                        else:
+                            year_id = get_or_create_folder(drive_service, root_id, f"{year} Edition")
+
+                        # Create the new standard month folder
+                        target_month_name = f"{month_num:02d} - {month_name} {year}"
+                        new_month_id = get_or_create_folder(drive_service, year_id, target_month_name)
+
+                        # Execute transfer
+                        data, msg = execute_article_transfer(source_id, new_month_id)
+                        st.session_state.folder_action = None
+                        if data:
+                            st.success(msg)
+                            st.balloons()
+                        else:
+                            st.info(msg)
+                    except Exception as e:
+                        st.error(f"حدث خطأ: {e}")
+
+        with c2:
+            if st.button("❌ إلغاء"):
+                st.session_state.folder_action = None
+                st.rerun()
