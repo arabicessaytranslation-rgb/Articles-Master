@@ -28,17 +28,14 @@ TEAM_RECIPIENTS = [
     "ahmad2075533@gmail.com"
 ]
 
-# العناوين التسعة الرسمية لجدول التتبع
+# الهيكل المعتمد (6 أعمدة فقط)
 TRACKER_HEADERS = [
-    "السنة",
-    "الشهر",
-    "رقم المقال",
+    "المترجم",
+    "المدقق",
+    "المسجل",
     "عنوان المقال",
-    "عدد الكلمات",
-    "رابط المستند",
-    "File ID",
-    "المترجم / المسؤول",
-    "حالة الإنجاز"
+    "رابط المقال",
+    "السنة والشهر للعدد"
 ]
 
 def get_google_services():
@@ -62,15 +59,15 @@ def extract_folder_id(url):
 # ==========================================
 def strip_copy_prefix(name):
     """
-    إزالة بادئة 'Copy of' أو 'نسخة من' مع الحفاظ التام والذكي
-    على ترقيم المقالات مثل: 'Copy of 6. T/DD' -> '6. T/DD'
+    إزالة بادئة 'Copy of' أو 'نسخة من' مع الحفاظ التام
+    على ترقيم المقالات (مثال: 'Copy of 6. Article' -> '6. Article').
     """
     pattern = r'^(?:(?:copy\b(?:\s*\(\d+\)|\s+\d+)?\s+of\s*)|(?:نسخة\b(?:\s*\(\d+\)|\s+\d+)?\s+من\s*)|(?:copy\s*[:\-])\s*)+'
     cleaned = re.sub(pattern, '', name, flags=re.IGNORECASE).strip()
     return cleaned
 
 def clean_article_title(raw_title):
-    """تنظيف العنوان من الامتدادات والبادئات للمقارنة الذكية"""
+    """تنظيف العنوان من الامتدادات والرموز لتسهيل المقارنة والفحص"""
     title = strip_copy_prefix(raw_title)
     title = re.sub(r'\.(docx|doc|gdoc|pdf)$', '', title, flags=re.IGNORECASE)
     title = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s]', ' ', title)
@@ -183,92 +180,81 @@ def compare_file_lists(source_files, dest_files, similarity_threshold=0.75):
 # ==========================================
 # 4. Sheets & Email Operations
 # ==========================================
-def ensure_headers_and_sync_tracker(gc, sheet_id, year, month_name, month_num, new_records):
+def reset_and_populate_tracker(gc, sheet_id, year, month_name, month_num, records):
     """
-    إنشاء عناوين الجدول التسعة مرة واحدة فقط إن لم تكن موجودة في الصف الأول،
-    ثم إلحاق المقالات مرتبة رقمياً بصيغة HYPERLINK مع منع التكرار باستخدام File ID.
+    يمسح محتويات الجدول بالكامل من الصف الثاني فما دون مع الحفاظ التام على رؤوس الأعمدة (A1:F1).
+    ثم يعيد تعبئة الجدول بجميع مقالات العدد مرتبة رقمياً بصيغة HYPERLINK.
     """
     sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
     existing_rows = sheet.get_all_values()
 
-    # 1. التحقق الدقيق من وجود العناوين في الصف الأول
-    headers_exist = False
+    # 1. التأكد من وجود العناوين الستة وتثبيتها في الصف الأول
+    headers_match = False
     if existing_rows and len(existing_rows) > 0:
         first_row = [str(c).strip() for c in existing_rows[0]]
-        # إذا كان الصف الأول يحتوي بالفعل على العناوين المطلوبة
-        if len(first_row) >= len(TRACKER_HEADERS) and first_row[0] == TRACKER_HEADERS[0] and first_row[6] == "File ID":
-            headers_exist = True
+        if len(first_row) >= len(TRACKER_HEADERS) and first_row[:len(TRACKER_HEADERS)] == TRACKER_HEADERS:
+            headers_match = True
 
-    # 2. إنشاء العناوين مرة واحدة إذا لم تكن موجودة
-    if not headers_exist:
-        # إذا كان الجدول يحتوي فقط على خلايا فارغة مشوهة، نفرغها
-        if not existing_rows or all(all(cell.strip() == '' for cell in row) for row in existing_rows):
-            sheet.clear()
-        # كتابة العناوين التسعة في الصف الأول A1:I1
-        sheet.update(range_name='A1:I1', values=[TRACKER_HEADERS], value_input_option='USER_ENTERED')
+    if not headers_match:
+        sheet.update(range_name='A1:F1', values=[TRACKER_HEADERS], value_input_option='USER_ENTERED')
         try:
-            sheet.freeze(rows=1) # تثبيت الصف الأول دائماً
+            sheet.freeze(rows=1)
         except Exception:
             pass
-        existing_rows = sheet.get_all_values()
 
-    # 3. حصر معرّفات الملفات الموجودة مسبقاً لمنع التكرار (العمود G - الفهرس 6)
-    existing_file_ids = set()
-    for row in existing_rows[1:]:
-        if len(row) > 6 and row[6].strip():
-            existing_file_ids.add(row[6].strip())
+    # 2. مسح كل البيانات السابقة ابتداءً من الصف الثاني فما دون (دون المساس بالرؤوس في الصف الأول)
+    try:
+        sheet.batch_clear(["A2:Z"])
+    except Exception:
+        total_rows = len(existing_rows) if existing_rows else 100
+        if total_rows > 1:
+            sheet.batch_clear([f"A2:Z{total_rows}"])
 
-    # استبعاد أي ملف موجود مسبقاً
-    records_to_add = [r for r in new_records if r["file_id"] not in existing_file_ids]
-    if not records_to_add:
+    if not records:
         return 0
 
-    # 4. ترتيب المقالات تصاعدياً حسب رقم المقال (1, 2, 3...)
-    records_to_add.sort(key=lambda x: extract_article_number(x["clean_name"]))
+    # 3. ترتيب المقالات تصاعدياً حسب رقم المقال (1، 2، 3...)
+    sorted_records = sorted(records, key=lambda x: extract_article_number(x["clean_name"]))
 
-    # 5. بناء الأسطر مع معادلة الرابط التفاعلية والحقول اليدوية
-    month_label = f"{month_num:02d} - {month_name}"
+    # 4. بناء الأسطر الجديدة وفق الترتيب المطلوب
+    edition_label = f"{month_num:02d} - {month_name} {year}"
     rows_payload = []
-    for r in records_to_add:
-        article_num = extract_article_number(r["clean_name"])
-        article_num_str = str(article_num) if article_num != 9999 else "-"
-        hyperlink_formula = f'=HYPERLINK("{r["doc_url"]}", "افتح المستند")'
+    for r in sorted_records:
+        hyperlink_formula = f'=HYPERLINK("{r["doc_url"]}", "افتح المقال")'
 
         rows_payload.append([
-            str(year),              # Col A: السنة
-            month_label,            # Col B: الشهر
-            article_num_str,        # Col C: رقم المقال
+            "",                     # Col A: المترجم
+            "",                     # Col B: المدقق
+            "",                     # Col C: المسجل
             r["clean_name"],        # Col D: عنوان المقال
-            r["word_count"],        # Col E: عدد الكلمات
-            hyperlink_formula,      # Col F: رابط المستند
-            r["file_id"],           # Col G: File ID
-            "",                     # Col H: المترجم / المسؤول (متروك للتعيين اليدوي)
-            "قيد الترجمة"           # Col I: حالة الإنجاز (الحالة الافتراضية)
+            hyperlink_formula,      # Col E: رابط المقال
+            edition_label           # Col F: السنة والشهر للعدد
         ])
 
-    # 6. كتابة الأسطر مع تفعيل الصيغ عبر USER_ENTERED
-    sheet.append_rows(rows_payload, value_input_option='USER_ENTERED')
+    # 5. كتابة البيانات الجديدة مباشرة بدءاً من الخلية A2
+    sheet.update(range_name=f'A2:F{len(rows_payload)+1}', values=rows_payload, value_input_option='USER_ENTERED')
     return len(rows_payload)
 
-def send_notification_email(table_data):
+def send_notification_email(table_data, edition_label=""):
     """إرسال إيميل التنبيه للفريق مع الروابط"""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
 
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = "تحديث: مقالات جديدة جاهزة للعمل المشترك"
+    subject_tag = f" ({edition_label})" if edition_label else ""
+    msg['Subject'] = f"تحديث: مقالات جديدة جاهزة للعمل المشترك{subject_tag}"
     msg['From'] = sender
     msg['To'] = ", ".join(TEAM_RECIPIENTS)
 
-    html = """
+    html = f"""
     <html dir="rtl">
       <body style="font-family: Arial, sans-serif;">
-        <h3 style="color: #2E86C1;">قائمة المقالات الجديدة المضافة:</h3>
+        <h3 style="color: #2E86C1;">قائمة المقالات الجديدة المضافة {subject_tag}:</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center;">
           <tr style="background-color: #f2f2f2;">
             <th>عنوان المقال</th>
             <th>عدد الكلمات</th>
-            <th>رابط المستند</th>
+            <th>رابط المقال</th>
           </tr>
     """
     for row in table_data[1:]:
@@ -276,7 +262,7 @@ def send_notification_email(table_data):
           <tr>
             <td style="text-align: right; padding-right: 12px;">{row[0]}</td>
             <td>{row[1]}</td>
-            <td><a href="{row[2]}" style="color: #2980B9; text-decoration: none; font-weight: bold;">افتح المستند</a></td>
+            <td><a href="{row[2]}" style="color: #2980B9; text-decoration: none; font-weight: bold;">افتح المقال</a></td>
           </tr>
         """
     html += """
@@ -295,13 +281,15 @@ def send_notification_email(table_data):
 # 5. Core Execution Engine
 # ==========================================
 def execute_article_transfer(files_to_transfer, destination_folder_id, year=None, month_name=None, month_num=None, update_sheet_and_email=True):
-    """نسخ الملفات بدون Copy of، وتحديث الشيت، وإرسال التنبيهات"""
+    """نسخ الملفات بدون Copy of، ومسح وإعادة تعبئة الشيت، وإرسال التنبيهات"""
     gc, drive_service, docs_service = get_google_services()
     sheet_id = st.secrets["SHEET_ID"]
     
     new_records = []
     email_table_data = [["عنوان المقال", "عدد الكلمات", "رابط المستند"]]
+    edition_label = f"{month_num:02d} - {month_name} {year}" if year and month_num else ""
 
+    # 1. نسخ الملفات المطلوبة إلى مجلد الوجهة
     for file_info in files_to_transfer:
         raw_name = file_info['name']
         final_clean_name = strip_copy_prefix(raw_name)
@@ -321,22 +309,45 @@ def execute_article_transfer(files_to_transfer, destination_folder_id, year=None
         doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
         word_count = count_words(docs_service, doc_id)
 
-        new_records.append({
+        record = {
             "clean_name": final_clean_name,
             "word_count": word_count,
             "doc_url": doc_url,
             "file_id": doc_id
-        })
+        }
+        new_records.append(record)
         email_table_data.append([final_clean_name, word_count, doc_url])
 
-    if update_sheet_and_email and new_records:
-        ensure_headers_and_sync_tracker(gc, sheet_id, year, month_name, month_num, new_records)
+    # 2. تحديث جدول المتابعة (مسح ما تحت الرؤوس وتعبئة جميع مقالات مجلد هذا العدد)
+    if update_sheet_and_email:
+        # قراءة جميع الملفات في مجلد الوجهة لضمان ظهور كامل مقالات هذا العدد في الجدول
+        all_dest_files = list_files_in_folder(drive_service, destination_folder_id)
+        cached_records = {r["file_id"]: r for r in new_records}
+        
+        final_sheet_records = []
+        for f in all_dest_files:
+            f_id = f['id']
+            if f_id in cached_records:
+                final_sheet_records.append(cached_records[f_id])
+            else:
+                f_clean_name = strip_copy_prefix(f['name'])
+                f_url = f"https://docs.google.com/document/d/{f_id}/edit"
+                f_words = count_words(docs_service, f_id)
+                final_sheet_records.append({
+                    "clean_name": f_clean_name,
+                    "word_count": f_words,
+                    "doc_url": f_url,
+                    "file_id": f_id
+                })
+
+        reset_and_populate_tracker(gc, sheet_id, year, month_name, month_num, final_sheet_records)
+        
         try:
-            send_notification_email(email_table_data)
+            send_notification_email(email_table_data, edition_label)
         except Exception as e:
             return new_records, f"تم نسخ {len(new_records)} مقال وتحديث الجدول، لكن تعذر إرسال الإيميل: {e}"
 
-    return new_records, f"تم بنجاح نسخ {len(new_records)} مقال وتحديث جدول المتابعة بالعناوين الصحيحة."
+    return new_records, f"تم بنجاح نسخ {len(new_records)} مقال، ومسح وتحديث جدول المتابعة بالكامل وفق الهيكل الجديد."
 
 # ==========================================
 # 6. Streamlit User Interface
@@ -443,7 +454,7 @@ with tab1:
             c1, c2, c3 = st.columns(3)
             with c1:
                 if new_files and st.button(f"✅ نسخ المقالات الجديدة فقط ({len(new_files)})", key="copy_new_tab1"):
-                    with st.spinner("جاري نسخ الجديد وتحديث جدول التتبع..."):
+                    with st.spinner("جاري نسخ الجديد وتحديث جدول التتبع بالكامل..."):
                         gc, drive_service, docs_service = get_google_services()
                         root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
                         
@@ -465,7 +476,7 @@ with tab1:
 
             with c2:
                 if st.button("⚡ نسخ جميع الملفات وتجاوز التشابه", key="copy_all_tab1"):
-                    with st.spinner("جاري نسخ كافة الملفات وتحديث الجدول..."):
+                    with st.spinner("جاري نسخ كافة الملفات ومسح وتحديث الجدول..."):
                         gc, drive_service, docs_service = get_google_services()
                         root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
                         target_m_id = m_folder['id'] if m_folder else get_or_create_folder(
