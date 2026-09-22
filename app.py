@@ -28,8 +28,21 @@ TEAM_RECIPIENTS = [
     "ahmad2075533@gmail.com"
 ]
 
+# العناوين التسعة الرسمية لجدول التتبع
+TRACKER_HEADERS = [
+    "السنة",
+    "الشهر",
+    "رقم المقال",
+    "عنوان المقال",
+    "عدد الكلمات",
+    "رابط المستند",
+    "File ID",
+    "المترجم / المسؤول",
+    "حالة الإنجاز"
+]
+
 def get_google_services():
-    """Initializes Google API clients using your stored OAuth token."""
+    """تهيئة الاتصال بخدمات جوجل عبر OAuth الشخصي"""
     creds_dict = json.loads(st.secrets["gcp_oauth_token"])
     creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
     
@@ -40,31 +53,31 @@ def get_google_services():
     return gc, drive_service, docs_service
 
 def extract_folder_id(url):
-    """Extracts Drive folder ID from a URL."""
+    """استخراج المعرف من رابط جوجل درايف"""
     match = re.search(r'folders/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
 
 # ==========================================
-# 2. Text Cleaning & Similarity Logic
+# 2. Text Cleaning & Sorting Helpers
 # ==========================================
 def strip_copy_prefix(name):
     """
-    Strips 'Copy of', 'Copy (1) of', 'نسخة من' while strictly 
-    preserving article numbers (e.g. 'Copy of 6. Article' -> '6. Article').
+    إزالة بادئة 'Copy of' أو 'نسخة من' مع الحفاظ التام والذكي
+    على ترقيم المقالات مثل: 'Copy of 6. T/DD' -> '6. T/DD'
     """
     pattern = r'^(?:(?:copy\b(?:\s*\(\d+\)|\s+\d+)?\s+of\s*)|(?:نسخة\b(?:\s*\(\d+\)|\s+\d+)?\s+من\s*)|(?:copy\s*[:\-])\s*)+'
     cleaned = re.sub(pattern, '', name, flags=re.IGNORECASE).strip()
     return cleaned
 
 def clean_article_title(raw_title):
-    """Normalizes titles for comparison by stripping extensions, copy-prefixes, and symbols."""
+    """تنظيف العنوان من الامتدادات والبادئات للمقارنة الذكية"""
     title = strip_copy_prefix(raw_title)
     title = re.sub(r'\.(docx|doc|gdoc|pdf)$', '', title, flags=re.IGNORECASE)
     title = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s]', ' ', title)
     return re.sub(r'\s+', ' ', title).strip().lower()
 
 def extract_article_number(title):
-    """Extracts leading or isolated article numbers for natural sorting."""
+    """استخراج رقم المقال لترتيب الأسطر تصاعدياً بشكل طبيعي"""
     match = re.search(r'^\s*(\d+)\s*[\.\-_]', title)
     if match:
         return int(match.group(1))
@@ -72,7 +85,7 @@ def extract_article_number(title):
     return int(nums[0]) if nums else 9999
 
 def compute_title_similarity(t1, t2):
-    """Calculates similarity score (0.0 to 1.0) between two article titles."""
+    """حساب نسبة تشابه العناوين"""
     c1 = clean_article_title(t1)
     c2 = clean_article_title(t2)
     if not c1 or not c2:
@@ -84,10 +97,10 @@ def compute_title_similarity(t1, t2):
     return SequenceMatcher(None, c1, c2).ratio()
 
 # ==========================================
-# 3. Google Drive & Docs Helpers
+# 3. Google Drive Operations
 # ==========================================
 def list_subfolders(drive_service, parent_id):
-    """Lists subfolders inside parent folder."""
+    """جلب المجلدات الفرعية"""
     query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     response = drive_service.files().list(
         q=query,
@@ -99,7 +112,7 @@ def list_subfolders(drive_service, parent_id):
     return response.get('files', [])
 
 def list_files_in_folder(drive_service, folder_id):
-    """Lists non-folder files inside a specific folder."""
+    """جلب الملفات من المجلد"""
     query = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
     response = drive_service.files().list(
         q=query,
@@ -111,7 +124,7 @@ def list_files_in_folder(drive_service, folder_id):
     return response.get('files', [])
 
 def get_or_create_folder(drive_service, parent_id, folder_name):
-    """Creates a new folder under parent."""
+    """إنشاء مجلد في حال عدم وجوده"""
     metadata = {
         'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder',
@@ -121,7 +134,7 @@ def get_or_create_folder(drive_service, parent_id, folder_name):
     return created.get('id')
 
 def count_words(docs_service, document_id):
-    """Counts words directly from the Google Doc body."""
+    """حساب عدد الكلمات الحقيقي من المستند"""
     try:
         doc = docs_service.documents().get(documentId=document_id).execute()
         text = "".join([
@@ -134,7 +147,7 @@ def count_words(docs_service, document_id):
         return "N/A"
 
 def compare_file_lists(source_files, dest_files, similarity_threshold=0.75):
-    """Compares source files against destination files to isolate duplicates vs new items."""
+    """مقارنة الملفات وفرز الجديد عن المتشابه"""
     similar_pairs = []
     new_files = []
 
@@ -168,62 +181,77 @@ def compare_file_lists(source_files, dest_files, similarity_threshold=0.75):
     return similar_pairs, new_files
 
 # ==========================================
-# 4. Google Sheets & Email Handlers
+# 4. Sheets & Email Operations
 # ==========================================
-def sync_to_translation_tracker(gc, sheet_id, year, month_name, month_num, new_records):
+def ensure_headers_and_sync_tracker(gc, sheet_id, year, month_name, month_num, new_records):
     """
-    Safely logs records to Google Sheets:
-    - Never clears headers or existing rows.
-    - Uses File ID (Col G) as primary key to prevent duplication.
-    - Injects interactive clickable =HYPERLINK() formulas.
-    - Preserves manual columns for Translator and Status.
+    إنشاء عناوين الجدول التسعة مرة واحدة فقط إن لم تكن موجودة في الصف الأول،
+    ثم إلحاق المقالات مرتبة رقمياً بصيغة HYPERLINK مع منع التكرار باستخدام File ID.
     """
     sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
     existing_rows = sheet.get_all_values()
-    
-    headers = [
-        "السنة", "الشهر", "رقم المقال", "عنوان المقال", 
-        "عدد الكلمات", "المستند", "File ID", "المترجم", "الحالة"
-    ]
-    
-    if not existing_rows or len(existing_rows) == 0:
-        sheet.update(range_name='A1:I1', values=[headers])
-        existing_rows = [headers]
-        existing_file_ids = set()
-    else:
-        existing_file_ids = {row[6] for row in existing_rows[1:] if len(row) > 6}
 
+    # 1. التحقق الدقيق من وجود العناوين في الصف الأول
+    headers_exist = False
+    if existing_rows and len(existing_rows) > 0:
+        first_row = [str(c).strip() for c in existing_rows[0]]
+        # إذا كان الصف الأول يحتوي بالفعل على العناوين المطلوبة
+        if len(first_row) >= len(TRACKER_HEADERS) and first_row[0] == TRACKER_HEADERS[0] and first_row[6] == "File ID":
+            headers_exist = True
+
+    # 2. إنشاء العناوين مرة واحدة إذا لم تكن موجودة
+    if not headers_exist:
+        # إذا كان الجدول يحتوي فقط على خلايا فارغة مشوهة، نفرغها
+        if not existing_rows or all(all(cell.strip() == '' for cell in row) for row in existing_rows):
+            sheet.clear()
+        # كتابة العناوين التسعة في الصف الأول A1:I1
+        sheet.update(range_name='A1:I1', values=[TRACKER_HEADERS], value_input_option='USER_ENTERED')
+        try:
+            sheet.freeze(rows=1) # تثبيت الصف الأول دائماً
+        except Exception:
+            pass
+        existing_rows = sheet.get_all_values()
+
+    # 3. حصر معرّفات الملفات الموجودة مسبقاً لمنع التكرار (العمود G - الفهرس 6)
+    existing_file_ids = set()
+    for row in existing_rows[1:]:
+        if len(row) > 6 and row[6].strip():
+            existing_file_ids.add(row[6].strip())
+
+    # استبعاد أي ملف موجود مسبقاً
     records_to_add = [r for r in new_records if r["file_id"] not in existing_file_ids]
     if not records_to_add:
         return 0
 
-    # Natural numeric sorting
+    # 4. ترتيب المقالات تصاعدياً حسب رقم المقال (1, 2, 3...)
     records_to_add.sort(key=lambda x: extract_article_number(x["clean_name"]))
 
+    # 5. بناء الأسطر مع معادلة الرابط التفاعلية والحقول اليدوية
     month_label = f"{month_num:02d} - {month_name}"
     rows_payload = []
     for r in records_to_add:
         article_num = extract_article_number(r["clean_name"])
         article_num_str = str(article_num) if article_num != 9999 else "-"
         hyperlink_formula = f'=HYPERLINK("{r["doc_url"]}", "افتح المستند")'
-        
+
         rows_payload.append([
-            str(year),
-            month_label,
-            article_num_str,
-            r["clean_name"],
-            r["word_count"],
-            hyperlink_formula,
-            r["file_id"],
-            "",                 # Column H: Translator (manual)
-            "قيد الترجمة"       # Column I: Default Status
+            str(year),              # Col A: السنة
+            month_label,            # Col B: الشهر
+            article_num_str,        # Col C: رقم المقال
+            r["clean_name"],        # Col D: عنوان المقال
+            r["word_count"],        # Col E: عدد الكلمات
+            hyperlink_formula,      # Col F: رابط المستند
+            r["file_id"],           # Col G: File ID
+            "",                     # Col H: المترجم / المسؤول (متروك للتعيين اليدوي)
+            "قيد الترجمة"           # Col I: حالة الإنجاز (الحالة الافتراضية)
         ])
 
+    # 6. كتابة الأسطر مع تفعيل الصيغ عبر USER_ENTERED
     sheet.append_rows(rows_payload, value_input_option='USER_ENTERED')
     return len(rows_payload)
 
 def send_notification_email(table_data):
-    """Sends HTML notification email with direct links."""
+    """إرسال إيميل التنبيه للفريق مع الروابط"""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
 
@@ -267,7 +295,7 @@ def send_notification_email(table_data):
 # 5. Core Execution Engine
 # ==========================================
 def execute_article_transfer(files_to_transfer, destination_folder_id, year=None, month_name=None, month_num=None, update_sheet_and_email=True):
-    """Copies files into destination with cleaned names, updates Sheets, and alerts team."""
+    """نسخ الملفات بدون Copy of، وتحديث الشيت، وإرسال التنبيهات"""
     gc, drive_service, docs_service = get_google_services()
     sheet_id = st.secrets["SHEET_ID"]
     
@@ -302,13 +330,13 @@ def execute_article_transfer(files_to_transfer, destination_folder_id, year=None
         email_table_data.append([final_clean_name, word_count, doc_url])
 
     if update_sheet_and_email and new_records:
-        sync_to_translation_tracker(gc, sheet_id, year, month_name, month_num, new_records)
+        ensure_headers_and_sync_tracker(gc, sheet_id, year, month_name, month_num, new_records)
         try:
             send_notification_email(email_table_data)
         except Exception as e:
-            return new_records, f"تم نسخ {len(new_records)} مقال وتحديث الجدول، لكن فشل إرسال الإيميل: {e}"
+            return new_records, f"تم نسخ {len(new_records)} مقال وتحديث الجدول، لكن تعذر إرسال الإيميل: {e}"
 
-    return new_records, f"تم بنجاح نسخ {len(new_records)} مقال مع تنظيف الأسماء وتحديث المنظومة بالكامل."
+    return new_records, f"تم بنجاح نسخ {len(new_records)} مقال وتحديث جدول المتابعة بالعناوين الصحيحة."
 
 # ==========================================
 # 6. Streamlit User Interface
@@ -415,7 +443,7 @@ with tab1:
             c1, c2, c3 = st.columns(3)
             with c1:
                 if new_files and st.button(f"✅ نسخ المقالات الجديدة فقط ({len(new_files)})", key="copy_new_tab1"):
-                    with st.spinner("جاري نسخ الجديد وتحديث النظام..."):
+                    with st.spinner("جاري نسخ الجديد وتحديث جدول التتبع..."):
                         gc, drive_service, docs_service = get_google_services()
                         root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
                         
@@ -437,7 +465,7 @@ with tab1:
 
             with c2:
                 if st.button("⚡ نسخ جميع الملفات وتجاوز التشابه", key="copy_all_tab1"):
-                    with st.spinner("جاري نسخ كافة الملفات..."):
+                    with st.spinner("جاري نسخ كافة الملفات وتحديث الجدول..."):
                         gc, drive_service, docs_service = get_google_services()
                         root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
                         target_m_id = m_folder['id'] if m_folder else get_or_create_folder(
