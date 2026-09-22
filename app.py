@@ -34,21 +34,24 @@ def extract_folder_id(url):
     match = re.search(r'folders/([a-zA-Z0-9_-]+)', url)
     return match.group(1) if match else None
 
-def normalize_string(val):
-    """Cleans text for folder name matching."""
-    val = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s]', ' ', val)
-    return re.sub(r'\s+', ' ', val).strip().lower()
+def strip_copy_prefix(name):
+    """
+    Strips Google Drive copy prefixes ('Copy of', 'Copy (1) of', 'Copy 2 of', 'نسخة من')
+    while strictly preserving article numbering (e.g. 'Copy of 6. Title' -> '6. Title').
+    """
+    pattern = r'^(?:(?:copy\b(?:\s*\(\d+\)|\s+\d+)?\s+of\s*)|(?:نسخة\b(?:\s*\(\d+\)|\s+\d+)?\s+من\s*)|(?:copy\s*[:\-])\s*)+'
+    cleaned = re.sub(pattern, '', name, flags=re.IGNORECASE).strip()
+    return cleaned
 
 def clean_article_title(raw_title):
-    """Normalizes article filenames for fuzzy title comparison."""
-    # Strip common file extensions
-    title = re.sub(r'\.(docx|doc|gdoc|pdf)$', '', raw_title, flags=re.IGNORECASE)
-    # Remove symbols and punctuation while preserving Arabic, English, and numbers
+    """Normalizes titles for fuzzy comparison."""
+    title = strip_copy_prefix(raw_title)
+    title = re.sub(r'\.(docx|doc|gdoc|pdf)$', '', title, flags=re.IGNORECASE)
     title = re.sub(r'[^a-zA-Z0-9\u0600-\u06FF\s]', ' ', title)
     return re.sub(r'\s+', ' ', title).strip().lower()
 
 def compute_title_similarity(t1, t2):
-    """Calculates similarity score (0.0 to 1.0) between two article titles."""
+    """Calculates similarity score (0.0 to 1.0) between two titles."""
     c1 = clean_article_title(t1)
     c2 = clean_article_title(t2)
     if not c1 or not c2:
@@ -60,7 +63,7 @@ def compute_title_similarity(t1, t2):
     return SequenceMatcher(None, c1, c2).ratio()
 
 def list_subfolders(drive_service, parent_id):
-    """Lists non-trashed subfolders inside a parent folder."""
+    """Lists subfolders inside parent."""
     query = f"'{parent_id}' in parents and mimeType = 'application/vnd.google-apps.folder' and trashed = false"
     response = drive_service.files().list(
         q=query,
@@ -72,7 +75,7 @@ def list_subfolders(drive_service, parent_id):
     return response.get('files', [])
 
 def list_files_in_folder(drive_service, folder_id):
-    """Lists non-folder files inside a specific folder."""
+    """Lists files inside folder (excluding subfolders)."""
     query = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
     response = drive_service.files().list(
         q=query,
@@ -83,104 +86,8 @@ def list_files_in_folder(drive_service, folder_id):
     ).execute()
     return response.get('files', [])
 
-def inspect_repository_and_content(drive_service, root_folder_id, source_folder_id, target_year, target_month_num, similarity_threshold=0.75):
-    """
-    Performs full pre-flight scan:
-    1. Detects Year and Month folders.
-    2. Scans files in source vs destination.
-    3. Detects similar articles by fuzzy matching titles.
-    """
-    # 1. Fetch Source Files
-    source_files = list_files_in_folder(drive_service, source_folder_id)
-
-    # 2. Inspect Year Folder
-    year_folders = list_subfolders(drive_service, root_folder_id)
-    year_str = str(target_year)
-    matched_year = None
-
-    for folder in year_folders:
-        tokens = re.findall(r'\b\d{4}\b', folder['name'])
-        if year_str in tokens or year_str in folder['name']:
-            matched_year = folder
-            break
-
-    if not matched_year:
-        for folder in year_folders:
-            sim = SequenceMatcher(None, normalize_string(f"{target_year} Edition"), normalize_string(folder['name'])).ratio()
-            if sim >= 0.70:
-                matched_year = folder
-                break
-
-    # 3. Inspect Month Folder
-    matched_month = None
-    if matched_year:
-        month_folders = list_subfolders(drive_service, matched_year['id'])
-        month_date = datetime.date(target_year, target_month_num, 1)
-        full_name = month_date.strftime('%B')
-        short_name = month_date.strftime('%b')
-        target_num_str = str(target_month_num)
-        target_num_padded = f"{target_month_num:02d}"
-
-        highest_score = 0.0
-        for folder in month_folders:
-            name_clean = normalize_string(folder['name'])
-            tokens = name_clean.split()
-            
-            has_name = (full_name.lower() in name_clean) or (short_name.lower() in tokens)
-            nums = re.findall(r'\b\d{1,2}\b', folder['name'])
-            has_num = (target_num_str in nums) or (target_num_padded in nums)
-
-            if has_name or has_num:
-                sim = SequenceMatcher(None, normalize_string(f"{target_num_padded} - {full_name} {target_year}"), name_clean).ratio()
-                if sim > highest_score:
-                    highest_score = sim
-                    matched_month = folder
-
-    # 4. Compare Content Similarities if Month Folder Exists
-    dest_files = []
-    similar_pairs = []
-    new_files = []
-
-    if matched_month:
-        dest_files = list_files_in_folder(drive_service, matched_month['id'])
-        
-        for s_file in source_files:
-            s_name = s_file['name']
-            best_dest_match = None
-            max_sim = 0.0
-
-            for d_file in dest_files:
-                d_name = d_file['name']
-                sim = compute_title_similarity(s_name, d_name)
-                if sim > max_sim:
-                    max_sim = sim
-                    best_dest_match = d_file
-
-            if max_sim >= similarity_threshold and best_dest_match:
-                similar_pairs.append({
-                    "source_id": s_file['id'],
-                    "source_name": s_name,
-                    "dest_name": best_dest_match['name'],
-                    "similarity": round(max_sim * 100, 1)
-                })
-            else:
-                new_files.append(s_file)
-    else:
-        new_files = source_files
-
-    return {
-        "source_files": source_files,
-        "year_exists": matched_year is not None,
-        "year_folder": matched_year,
-        "month_exists": matched_month is not None,
-        "month_folder": matched_month,
-        "existing_dest_files_count": len(dest_files),
-        "similar_pairs": similar_pairs,
-        "new_files": new_files
-    }
-
 def get_or_create_folder(drive_service, parent_id, folder_name):
-    """Creates folder under parent if needed."""
+    """Creates folder if needed."""
     metadata = {
         'name': folder_name,
         'mimeType': 'application/vnd.google-apps.folder',
@@ -190,7 +97,7 @@ def get_or_create_folder(drive_service, parent_id, folder_name):
     return created.get('id')
 
 def count_words(docs_service, document_id):
-    """Counts words from a Google Doc body."""
+    """Counts words from a Google Doc."""
     try:
         doc = docs_service.documents().get(documentId=document_id).execute()
         text = "".join([
@@ -203,7 +110,7 @@ def count_words(docs_service, document_id):
         return "N/A"
 
 def send_notification_email(table_data):
-    """Sends notification email to team recipients with direct document links."""
+    """Sends notification email to team recipients."""
     sender = st.secrets["sender_email"]
     password = st.secrets["app_password"]
     
@@ -251,29 +158,66 @@ def send_notification_email(table_data):
     server.sendmail(sender, recipients, msg.as_string())
     server.quit()
 
-def execute_article_transfer(files_to_transfer, month_folder_id):
-    """Copies specified list of files directly into the destination month folder."""
+def compare_file_lists(source_files, dest_files, similarity_threshold=0.75):
+    """Compares source files against destination files with fuzzy matching."""
+    similar_pairs = []
+    new_files = []
+
+    for s_file in source_files:
+        clean_s_name = strip_copy_prefix(s_file['name'])
+        best_dest_match = None
+        max_sim = 0.0
+
+        for d_file in dest_files:
+            clean_d_name = strip_copy_prefix(d_file['name'])
+            sim = compute_title_similarity(clean_s_name, clean_d_name)
+            if sim > max_sim:
+                max_sim = sim
+                best_dest_match = d_file
+
+        if max_sim >= similarity_threshold and best_dest_match:
+            similar_pairs.append({
+                "source_id": s_file['id'],
+                "source_name": s_file['name'],
+                "clean_name": clean_s_name,
+                "dest_name": best_dest_match['name'],
+                "similarity": round(max_sim * 100, 1)
+            })
+        else:
+            new_files.append({
+                "id": s_file['id'],
+                "name": s_file['name'],
+                "clean_name": clean_s_name
+            })
+
+    return similar_pairs, new_files
+
+def execute_article_transfer(files_to_transfer, destination_folder_id, update_sheet_and_email=True):
+    """
+    Copies files into the destination folder, cleans the copy prefixes from titles,
+    and optionally logs to Google Sheets and dispatches emails.
+    """
     gc, drive_service, docs_service = get_google_services()
-    sheet_id = st.secrets["SHEET_ID"]
+    table_data = []
 
-    if not files_to_transfer:
-        return None, "لا توجد ملفات محددة للنقل."
-
-    # Read current Google Sheet data
-    sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
-    existing_sheet_data = sheet.get_all_values()
-    table_data = existing_sheet_data if existing_sheet_data else [["عنوان المقال", "عدد الكلمات", "رابط المستند"]]
+    if update_sheet_and_email:
+        sheet_id = st.secrets["SHEET_ID"]
+        sheet = gc.open_by_key(sheet_id).worksheet("Translation_Tracker")
+        existing_sheet_data = sheet.get_all_values()
+        table_data = existing_sheet_data if existing_sheet_data else [["عنوان المقال", "عدد الكلمات", "رابط المستند"]]
 
     processed_count = 0
 
-    for file in files_to_transfer:
-        file_name = file['name']
+    for file_info in files_to_transfer:
+        raw_name = file_info['name']
+        final_clean_name = strip_copy_prefix(raw_name)
+
         copy_meta = {
-            'name': file_name,
-            'parents': [month_folder_id]
+            'name': final_clean_name,
+            'parents': [destination_folder_id]
         }
         copy_res = drive_service.files().copy(
-            fileId=file['id'],
+            fileId=file_info['id'],
             body=copy_meta,
             fields="id",
             supportsAllDrives=True
@@ -283,199 +227,257 @@ def execute_article_transfer(files_to_transfer, month_folder_id):
         doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
         word_count = count_words(docs_service, doc_id)
 
-        table_data.append([file_name, word_count, doc_url])
+        if update_sheet_and_email:
+            table_data.append([final_clean_name, word_count, doc_url])
         processed_count += 1
 
-    if processed_count > 0:
+    if update_sheet_and_email and processed_count > 0:
         sheet.clear()
         sheet.update(range_name='A1', values=table_data)
         try:
             send_notification_email(table_data)
         except Exception as e:
-            return table_data, f"تم نسخ {processed_count} مقال بنجاح، لكن تعذر إرسال الإيميل: {e}"
-        return table_data, f"تم بنجاح نسخ {processed_count} مقال إلى المجلد وتحديث جدول المتابعة وإرسال الإيميل."
-    else:
-        return None, "لم يتم نسخ أي ملفات جديدة."
+            return table_data, f"تم نسخ {processed_count} ملف بنجاح، لكن تعذر إرسال الإيميل: {e}"
+
+    return table_data, f"تم بنجاح نسخ {processed_count} ملف مع تنظيف الأسماء من 'Copy of' واعتماد أرقام المقالات."
 
 # ==========================================
-# Streamlit UI with Dual Verification
+# Streamlit UI
 # ==========================================
-st.set_page_config(page_title="بوابة استلام المقالات", page_icon="📂", layout="centered")
-st.title("بوابة استلام مقالات الترجمة")
+st.set_page_config(page_title="منظومة إدارة ونسخ المقالات", page_icon="📑", layout="wide")
+st.title("منظومة إدارة ونسخ مقالات الترجمة")
 
-if "inspection_data" not in st.session_state:
-    st.session_state.inspection_data = None
+tab1, tab2 = st.tabs(["📥 معالجة وإصدار المقالات الشهرية", "📂 نسخ مجلد إلى مستودع خارجي"])
 
-coordinator_url = st.text_input("رابط مجلد المنسق (Google Drive):")
+# -------------------------------------------------------------
+# TAB 1: Monthly Edition Processing (Year/Month Workflow)
+# -------------------------------------------------------------
+with tab1:
+    st.subheader("استلام وتوزيع مقالات الإصدار الشهري")
 
-col1, col2 = st.columns(2)
-with col1:
-    months = [
-        "January", "February", "March", "April", "May", "June",
-        "July", "August", "September", "October", "November", "December"
-    ]
-    selected_month_name = st.selectbox("شهر الإصدار:", months, index=datetime.datetime.now().month - 1)
-    selected_month_num = months.index(selected_month_name) + 1
+    if "inspection_data_tab1" not in st.session_state:
+        st.session_state.inspection_data_tab1 = None
 
-with col2:
-    current_year = datetime.datetime.now().year
-    selected_year = st.selectbox("سنة الإصدار:", range(current_year - 1, current_year + 5), index=1)
+    coordinator_url = st.text_input("رابط مجلد المنسق (Google Drive):", key="coord_url")
 
-# Step 1: Pre-Flight Scan & Content Inspection
-if st.button("فحص المجلد والمحتوى"):
-    if not coordinator_url:
-        st.warning("يرجى إدخال رابط المنسق أولاً.")
-    else:
-        source_folder_id = extract_folder_id(coordinator_url)
-        if not source_folder_id:
-            st.error("الرابط غير صحيح. يرجى التأكد من إدخال رابط مجلد صالح.")
+    col1, col2 = st.columns(2)
+    with col1:
+        months = [
+            "January", "February", "March", "April", "May", "June",
+            "July", "August", "September", "October", "November", "December"
+        ]
+        selected_month_name = st.selectbox("شهر الإصدار:", months, index=datetime.datetime.now().month - 1)
+        selected_month_num = months.index(selected_month_name) + 1
+
+    with col2:
+        current_year = datetime.datetime.now().year
+        selected_year = st.selectbox("سنة الإصدار:", range(current_year - 1, current_year + 5), index=1)
+
+    if st.button("فحص المجلد والمحتوى الشهري", key="btn_check_tab1"):
+        if not coordinator_url:
+            st.warning("يرجى إدخال رابط المنسق أولاً.")
         else:
-            with st.spinner("جاري فحص المجلد ومقارنة تشابه أسماء المقالات..."):
-                try:
-                    gc, drive_service, docs_service = get_google_services()
-                    root_folder_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
-                    
-                    inspection = inspect_repository_and_content(
-                        drive_service, root_folder_id, source_folder_id, selected_year, selected_month_num
-                    )
-                    
-                    st.session_state.inspection_data = {
-                        "source_folder_id": source_folder_id,
-                        "selected_year": selected_year,
-                        "selected_month_num": selected_month_num,
-                        "selected_month_name": selected_month_name,
-                        "inspection": inspection
-                    }
-                except Exception as e:
-                    st.error(f"حدث خطأ أثناء فحص البيانات: {e}")
-
-# Step 2: Interactive Decision Card (Approval Flow)
-if st.session_state.inspection_data:
-    st.markdown("---")
-    act = st.session_state.inspection_data
-    insp = act["inspection"]
-    source_files = insp["source_files"]
-    similar_pairs = insp["similar_pairs"]
-    new_files = insp["new_files"]
-    year = act["selected_year"]
-    month_name = act["selected_month_name"]
-    month_num = act["selected_month_num"]
-
-    if not source_files:
-        st.warning("مجلد المنسق فارغ، لا توجد ملفات لنقلها.")
-        if st.button("إغلاق"):
-            st.session_state.inspection_data = None
-            st.rerun()
-
-    elif insp["month_exists"]:
-        found_month_name = insp["month_folder"]["name"]
-        found_year_name = insp["year_folder"]["name"]
-        
-        st.warning(f"📁 **تنبيه:** تم العثور على مجلد مطابق: **`{found_month_name}`** داخل **`{found_year_name}`**")
-
-        # Check for title similarities
-        if similar_pairs:
-            st.error(f"⚠️ **تم اكتشاف مقالات مشابهة/موجودة مسبقاً ({len(similar_pairs)} من أصل {len(source_files)} ملفات):**")
-            
-            # Display comparison table
-            table_records = []
-            for p in similar_pairs:
-                table_records.append({
-                    "ملف المنسق (الجديد)": p["source_name"],
-                    "الملف الموجود المشابه": p["dest_name"],
-                    "نسبة التطابق": f"{p['similarity']}%"
-                })
-            st.dataframe(pd.DataFrame(table_records), use_container_width=True)
-
-            if new_files:
-                st.info(f"💡 توجد أيضاً **{len(new_files)}** مقالات جديدة تماماً لا يوجد لها تشابه.")
+            source_folder_id = extract_folder_id(coordinator_url)
+            if not source_folder_id:
+                st.error("الرابط غير صحيح.")
             else:
-                st.warning("⚠️ جميع المقالات في مجلد المنسق مشابهة جداً لمقالات موجودة مسبقاً في هذا المجلد.")
+                with st.spinner("جاري فحص المجلدات والمقارنة..."):
+                    try:
+                        gc, drive_service, docs_service = get_google_services()
+                        root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
+                        
+                        source_files = list_files_in_folder(drive_service, source_folder_id)
+                        
+                        # Locate Year folder
+                        year_folders = list_subfolders(drive_service, root_id)
+                        matched_year = next((f for f in year_folders if str(selected_year) in f['name']), None)
 
-            # Decision Buttons for Similarities
-            st.write("### اختر الإجراء المطلوب:")
-            c1, c2, c3 = st.columns([1.5, 1.2, 0.8])
-            
-            with c1:
-                if new_files:
-                    if st.button(f"✅ نسخ المقالات الجديدة فقط ({len(new_files)}) وتخطي المتشابهة"):
-                        with st.spinner("جاري استيراد المقالات الجديدة فقط..."):
-                            data, msg = execute_article_transfer(new_files, insp["month_folder"]["id"])
-                            st.session_state.inspection_data = None
-                            if data:
-                                st.success(msg)
-                                st.balloons()
-                            else:
-                                st.info(msg)
-                else:
-                    st.button("✅ نسخ المقالات الجديدة فقط", disabled=True)
+                        # Locate Month folder
+                        matched_month = None
+                        dest_files = []
+                        if matched_year:
+                            m_folders = list_subfolders(drive_service, matched_year['id'])
+                            t_num = str(selected_month_num)
+                            t_pad = f"{selected_month_num:02d}"
+                            for f in m_folders:
+                                f_lower = f['name'].lower()
+                                nums = re.findall(r'\b\d{1,2}\b', f['name'])
+                                if selected_month_name.lower() in f_lower or t_num in nums or t_pad in nums:
+                                    matched_month = f
+                                    dest_files = list_files_in_folder(drive_service, f['id'])
+                                    break
 
-            with c2:
-                if st.button("⚡ استيراد الكل وتجاهل التشابه"):
-                    with st.spinner("جاري استيراد جميع الملفات..."):
-                        data, msg = execute_article_transfer(source_files, insp["month_folder"]["id"])
-                        st.session_state.inspection_data = None
-                        if data:
-                            st.success(msg)
-                            st.balloons()
-                        else:
-                            st.info(msg)
+                        similar_pairs, new_files = compare_file_lists(source_files, dest_files)
 
-            with c3:
-                if st.button("❌ إلغاء العملية"):
-                    st.session_state.inspection_data = None
-                    st.rerun()
+                        st.session_state.inspection_data_tab1 = {
+                            "source_files": source_files,
+                            "similar_pairs": similar_pairs,
+                            "new_files": new_files,
+                            "year_folder": matched_year,
+                            "month_folder": matched_month,
+                            "selected_year": selected_year,
+                            "selected_month_num": selected_month_num,
+                            "selected_month_name": selected_month_name
+                        }
+                    except Exception as e:
+                        st.error(f"خطأ أثناء الفحص: {e}")
 
+    # Decision Block Tab 1
+    if st.session_state.inspection_data_tab1:
+        st.markdown("---")
+        info = st.session_state.inspection_data_tab1
+        similar_pairs = info["similar_pairs"]
+        new_files = info["new_files"]
+        source_files = info["source_files"]
+        m_folder = info["month_folder"]
+
+        if not source_files:
+            st.warning("مجلد المنسق فارغ.")
         else:
-            # Folder exists, but all files inside are completely different/new
-            st.success(f"المجلد موجود مسبقاً، ولكن جميع المقالات في رابط المنسق ({len(source_files)} مقال) جديدة تماماً ولا يوجد أي تشابه في العناوين.")
-            st.info("هل تود اعتماد هذا المجلد ونسخ الملفات إليه؟")
-            
-            c1, c2 = st.columns(2)
+            if m_folder:
+                st.warning(f"📁 المجلد المستهدف موجود مسبقاً: **`{m_folder['name']}`**")
+            else:
+                st.info(f"💡 سيتم إنشاء مجلد جديد باسم: **`{info['selected_month_num']:02d} - {info['selected_month_name']} {info['selected_year']}`**")
+
+            if similar_pairs:
+                st.error(f"⚠️ تم رصد مقالات متشابهة ({len(similar_pairs)} من أصل {len(source_files)}):")
+                st.dataframe(pd.DataFrame([{
+                    "اسم الملف الأصلي": p["source_name"],
+                    "الاسم بعد إزالة Copy of": p["clean_name"],
+                    "الملف المقابل بالمستودع": p["dest_name"],
+                    "التطابق": f"{p['similarity']}%"
+                } for p in similar_pairs]), use_container_width=True)
+
+            c1, c2, c3 = st.columns(3)
             with c1:
-                if st.button("✅ نعم، استمر واعتمد المجلد"):
-                    with st.spinner("جاري نسخ المقالات..."):
-                        data, msg = execute_article_transfer(source_files, insp["month_folder"]["id"])
-                        st.session_state.inspection_data = None
-                        if data:
-                            st.success(msg)
-                            st.balloons()
-                        else:
-                            st.info(msg)
-            with c2:
-                if st.button("❌ إلغاء"):
-                    st.session_state.inspection_data = None
-                    st.rerun()
-
-    else:
-        # Case: Brand new month folder
-        st.info(f"لم يتم العثور على مجلد سابق لشهر **{month_name} {year}**.")
-        st.write(f"سيتم إنشاء مجلد جديد باسم: **`{month_num:02d} - {month_name} {year}`** ونقل **{len(source_files)}** مقال إليه.")
-        
-        c1, c2 = st.columns(2)
-        with c1:
-            if st.button("✅ إنشاء المجلد وبدء النقل"):
-                with st.spinner("جاري إنشاء المجلد ونقل المقالات..."):
-                    gc, drive_service, docs_service = get_google_services()
-                    root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
-
-                    if insp["year_exists"]:
-                        year_id = insp["year_folder"]["id"]
-                    else:
-                        year_id = get_or_create_folder(drive_service, root_id, f"{year} Edition")
-
-                    target_month_name = f"{month_num:02d} - {month_name} {year}"
-                    new_month_id = get_or_create_folder(drive_service, year_id, target_month_name)
-
-                    data, msg = execute_article_transfer(source_files, new_month_id)
-                    st.session_state.inspection_data = None
-                    if data:
+                if new_files and st.button(f"✅ نسخ المقالات الجديدة فقط ({len(new_files)})", key="copy_new_tab1"):
+                    with st.spinner("جاري النسخ وتحديث النظام..."):
+                        gc, drive_service, docs_service = get_google_services()
+                        root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
+                        
+                        target_m_id = m_folder['id'] if m_folder else get_or_create_folder(
+                            drive_service, 
+                            info['year_folder']['id'] if info['year_folder'] else get_or_create_folder(drive_service, root_id, f"{info['selected_year']} Edition"),
+                            f"{info['selected_month_num']:02d} - {info['selected_month_name']} {info['selected_year']}"
+                        )
+                        _, msg = execute_article_transfer(new_files, target_m_id, update_sheet_and_email=True)
+                        st.session_state.inspection_data_tab1 = None
                         st.success(msg)
                         st.balloons()
-                    else:
-                        st.info(msg)
 
-        with c2:
-            if st.button("❌ إلغاء"):
-                st.session_state.inspection_data = None
-                st.rerun()
+            with c2:
+                if st.button("⚡ نسخ جميع الملفات وتجاوز التشابه", key="copy_all_tab1"):
+                    with st.spinner("جاري نسخ جميع الملفات..."):
+                        gc, drive_service, docs_service = get_google_services()
+                        root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
+                        target_m_id = m_folder['id'] if m_folder else get_or_create_folder(
+                            drive_service, 
+                            info['year_folder']['id'] if info['year_folder'] else get_or_create_folder(drive_service, root_id, f"{info['selected_year']} Edition"),
+                            f"{info['selected_month_num']:02d} - {info['selected_month_name']} {info['selected_year']}"
+                        )
+                        _, msg = execute_article_transfer(source_files, target_m_id, update_sheet_and_email=True)
+                        st.session_state.inspection_data_tab1 = None
+                        st.success(msg)
+                        st.balloons()
+
+            with c3:
+                if st.button("❌ إلغاء", key="cancel_tab1"):
+                    st.session_state.inspection_data_tab1 = None
+                    st.rerun()
+
+# -------------------------------------------------------------
+# TAB 2: Direct Folder-to-Folder Cloner
+# -------------------------------------------------------------
+with tab2:
+    st.subheader("نسخ محتوى مجلد كامل إلى مستودع خارجي مع الفحص الذكي")
+    st.caption("يقوم هذا القسم بنسخ الملفات بين أي مجلدين تمتلك صلاحية Editor عليهما، مع إزالة 'Copy of'، وحفظ تسلسل الأرقام، وتفادي تكرار المتشابهات.")
+
+    if "inspection_data_tab2" not in st.session_state:
+        st.session_state.inspection_data_tab2 = None
+
+    col_src, col_dst = st.columns(2)
+    with col_src:
+        src_url = st.text_input("رابط المجلد المصدر (Source Folder):", key="tab2_src")
+    with col_dst:
+        dst_url = st.text_input("رابط المستودع الهدف (Destination Folder):", key="tab2_dst")
+
+    if st.button("فحص ومقارنة المجلدين", key="btn_check_tab2"):
+        if not src_url or not dst_url:
+            st.warning("يرجى إدخال رابط المجلد المصدر ورابط المجلد الهدف.")
+        else:
+            src_id = extract_folder_id(src_url)
+            dst_id = extract_folder_id(dst_url)
+            if not src_id or not dst_id:
+                st.error("أحد الروابط غير صحيح. يرجى التأكد من روابط Google Drive.")
+            else:
+                with st.spinner("جاري فحص المجلدين وقراءة الملفات..."):
+                    try:
+                        gc, drive_service, docs_service = get_google_services()
+                        src_files = list_files_in_folder(drive_service, src_id)
+                        dst_files = list_files_in_folder(drive_service, dst_id)
+
+                        similar_pairs, new_files = compare_file_lists(src_files, dst_files)
+
+                        st.session_state.inspection_data_tab2 = {
+                            "src_id": src_id,
+                            "dst_id": dst_id,
+                            "src_files": src_files,
+                            "dst_files": dst_files,
+                            "similar_pairs": similar_pairs,
+                            "new_files": new_files
+                        }
+                    except Exception as e:
+                        st.error(f"حدث خطأ أثناء فحص المجلدات: {e}")
+
+    # Decision Block Tab 2
+    if st.session_state.inspection_data_tab2:
+        st.markdown("---")
+        info2 = st.session_state.inspection_data_tab2
+        similar_pairs = info2["similar_pairs"]
+        new_files = info2["new_files"]
+        src_files = info2["src_files"]
+        dst_id = info2["dst_id"]
+
+        if not src_files:
+            st.warning("المجلد المصدر لا يحتوي على أي ملفات.")
+        else:
+            st.write(f"📊 **إجمالي الملفات بالمصدر:** {len(src_files)} ملف | **الملفات الموجودة بالهدف:** {len(info2['dst_files'])} ملف")
+
+            if similar_pairs:
+                st.error(f"⚠️ تم رصد ({len(similar_pairs)}) ملفات موجودة أو مشابهة مسبقاً في المستودع الهدف:")
+                st.dataframe(pd.DataFrame([{
+                    "اسم الملف بالمصدر": p["source_name"],
+                    "الاسم بعد إزالة Copy of": p["clean_name"],
+                    "الملف المشابه بالمستودع الهدف": p["dest_name"],
+                    "نسبة التطابق": f"{p['similarity']}%"
+                } for p in similar_pairs]), use_container_width=True)
+
+            if new_files:
+                st.info(f"💡 توجد **{len(new_files)}** ملفات جديدة تماماً يمكن نسخها بأمان.")
+
+            st.write("### اختر إجراء النسخ:")
+            b1, b2, b3 = st.columns(3)
+
+            with b1:
+                if new_files:
+                    if st.button(f"✅ نسخ الملفات الجديدة فقط ({len(new_files)})", key="copy_new_tab2"):
+                        with st.spinner("جاري نسخ الملفات الجديدة مع تنظيف الأسماء..."):
+                            _, msg = execute_article_transfer(new_files, dst_id, update_sheet_and_email=False)
+                            st.session_state.inspection_data_tab2 = None
+                            st.success(msg)
+                            st.balloons()
+                else:
+                    st.button("✅ نسخ الملفات الجديدة فقط", disabled=True, key="dis_b1")
+
+            with b2:
+                if st.button(f"⚡ نسخ جميع ملفات المصدر ({len(src_files)}) وتجاوز التشابه", key="copy_all_tab2"):
+                    with st.spinner("جاري نسخ جميع الملفات مع تنظيف الأسماء..."):
+                        _, msg = execute_article_transfer(src_files, dst_id, update_sheet_and_email=False)
+                        st.session_state.inspection_data_tab2 = None
+                        st.success(msg)
+                        st.balloons()
+
+            with b3:
+                if st.button("❌ إلغاء العملية", key="cancel_tab2"):
+                    st.session_state.inspection_data_tab2 = None
+                    st.rerun()
