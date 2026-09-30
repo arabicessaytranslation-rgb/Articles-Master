@@ -116,11 +116,11 @@ def list_subfolders(drive_service, parent_id):
     return response.get('files', [])
 
 def list_files_in_folder(drive_service, folder_id):
-    """جلب الملفات من المجلد"""
+    """جلب الملفات من المجلد مع نوع الملف (mimeType) لغرض التحويل"""
     query = f"'{folder_id}' in parents and mimeType != 'application/vnd.google-apps.folder' and trashed = false"
     response = drive_service.files().list(
         q=query,
-        fields="files(id, name)",
+        fields="files(id, name, mimeType)", # Added mimeType to detect .docx
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
         pageSize=100
@@ -179,7 +179,8 @@ def compare_file_lists(source_files, dest_files, similarity_threshold=0.75):
             new_files.append({
                 "id": s_file['id'],
                 "name": s_file['name'],
-                "clean_name": clean_s_name
+                "clean_name": clean_s_name,
+                "mimeType": s_file.get('mimeType', '') # Pass mimeType for later conversion
             })
 
     return similar_pairs, new_files
@@ -382,7 +383,7 @@ def send_submission_notification_email(source_info, dest_info, copied_records):
 # 5. Execution Engines
 # ==========================================
 def execute_article_transfer(files_to_transfer, destination_folder_id, year=None, month_name=None, month_num=None, update_sheet_and_email=True):
-    """نسخ ملفات الإصدار الشهري وتحديث الشيت وإرسال إيميل الإصدار"""
+    """نسخ ملفات الإصدار الشهري وتحديث الشيت وإرسال إيميل الإصدار مع تحويل ملفات الوورد"""
     gc, drive_service, docs_service = get_google_services()
     sheet_id = st.secrets["SHEET_ID"]
     
@@ -398,6 +399,17 @@ def execute_article_transfer(files_to_transfer, destination_folder_id, year=None
             'name': final_clean_name,
             'parents': [destination_folder_id]
         }
+        
+        # --- AUTO-CONVERSION TRIGGER ---
+        # If the file is Microsoft Word (.docx or .doc), force the copy into a native Google Doc format
+        word_mime_types = [
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 
+            'application/msword'
+        ]
+        if file_info.get('mimeType') in word_mime_types:
+            copy_meta['mimeType'] = 'application/vnd.google-apps.document'
+        # -------------------------------
+
         copy_res = drive_service.files().copy(
             fileId=file_info['id'],
             body=copy_meta,
@@ -443,10 +455,10 @@ def execute_article_transfer(files_to_transfer, destination_folder_id, year=None
         except Exception as e:
             return new_records, f"تم نسخ الملفات وتحديث الجدول، لكن فشل إرسال الإيميل: {e}"
 
-    return new_records, f"تم بنجاح نسخ {len(new_records)} مقال وتحديث جدول المتابعة والإشعار بالبريد."
+    return new_records, f"تم بنجاح نسخ وتحويل {len(new_records)} مقال وتحديث جدول المتابعة والإشعار بالبريد."
 
 def execute_submission_transfer(files_to_transfer, source_folder_id, destination_folder_id):
-    """نسخ الملفات لمجلد التسليم وتوثيق ذلك بإيميل تفصيلي"""
+    """نسخ الملفات لمجلد التسليم وتوثيق ذلك بإيميل تفصيلي مع تحويل ملفات الوورد"""
     _, drive_service, docs_service = get_google_services()
     copied_records = []
 
@@ -458,6 +470,17 @@ def execute_submission_transfer(files_to_transfer, source_folder_id, destination
             'name': final_clean_name,
             'parents': [destination_folder_id]
         }
+        
+        # --- AUTO-CONVERSION TRIGGER ---
+        # If the file is Microsoft Word (.docx or .doc), force the copy into a native Google Doc format
+        word_mime_types = [
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document', 
+            'application/msword'
+        ]
+        if file_info.get('mimeType') in word_mime_types:
+            copy_meta['mimeType'] = 'application/vnd.google-apps.document'
+        # -------------------------------
+
         copy_res = drive_service.files().copy(
             fileId=file_info['id'],
             body=copy_meta,
@@ -480,9 +503,9 @@ def execute_submission_transfer(files_to_transfer, source_folder_id, destination
     try:
         send_submission_notification_email(src_info, dst_info, copied_records)
     except Exception as e:
-        return copied_records, f"تم نسخ {len(copied_records)} ملف إلى مجلد التسليم، لكن تعذر إرسال الإيميل: {e}"
+        return copied_records, f"تم نسخ وتحويل {len(copied_records)} ملف إلى مجلد التسليم، لكن تعذر إرسال الإيميل: {e}"
 
-    return copied_records, f"تم بنجاح تسليم ونسخ {len(copied_records)} ملف وتوثيق العملية بإيميل رسمي للفريق."
+    return copied_records, f"تم بنجاح تحويل ونسخ وتسليم {len(copied_records)} ملف وتوثيق العملية بإيميل رسمي للفريق."
 
 # ==========================================
 # 6. Streamlit User Interface
@@ -589,7 +612,7 @@ with tab1:
             c1, c2, c3 = st.columns(3)
             with c1:
                 if new_files and st.button(f"✅ نسخ المقالات الجديدة فقط ({len(new_files)})", key="copy_new_tab1"):
-                    with st.spinner("جاري نسخ الجديد وتحديث جدول التتبع وإرسال الإشعار..."):
+                    with st.spinner("جاري نسخ وتحويل الجديد وتحديث جدول التتبع وإرسال الإشعار..."):
                         gc, drive_service, docs_service = get_google_services()
                         root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
                         
@@ -610,8 +633,8 @@ with tab1:
                         st.balloons()
 
             with c2:
-                if st.button("⚡ نسخ جميع الملفات وتجاوز التشابه", key="copy_all_tab1"):
-                    with st.spinner("جاري نسخ كافة الملفات وتحديث الجدول..."):
+                if st.button("⚡ نسخ كافة الملفات وتجاوز التشابه", key="copy_all_tab1"):
+                    with st.spinner("جاري نسخ وتحويل كافة الملفات وتحديث الجدول..."):
                         gc, drive_service, docs_service = get_google_services()
                         root_id = st.secrets["ROOT_TRANSLATION_FOLDER_ID"]
                         target_m_id = m_folder['id'] if m_folder else get_or_create_folder(
@@ -703,7 +726,7 @@ with tab2:
 
             b1, b2, b3 = st.columns(3)
             with b1:
-                if new_files and st.button(f"✅ نسخ الملفات الجديدة فقط ({len(new_files)}) وإرسال إيميل التوثيق", key="copy_new_tab2"):
+                if new_files and st.button(f"✅ نسخ وتحويل الملفات الجديدة فقط ({len(new_files)}) وإرسال إيميل التوثيق", key="copy_new_tab2"):
                     with st.spinner("جاري النسخ وإرسال إيميل التوثيق..."):
                         _, msg = execute_submission_transfer(new_files, src_id, dst_id)
                         st.session_state.inspection_data_tab2 = None
@@ -711,8 +734,8 @@ with tab2:
                         st.balloons()
 
             with b2:
-                if st.button(f"⚡ نسخ كافة الملفات ({len(src_files)}) وتجاوز التشابه وإرسال الإيميل", key="copy_all_tab2"):
-                    with st.spinner("جاري نسخ جميع الملفات وإرسال الإيميل..."):
+                if st.button(f"⚡ نسخ وتحويل كافة الملفات ({len(src_files)}) وتجاوز التشابه وإرسال الإيميل", key="copy_all_tab2"):
+                    with st.spinner("جاري نسخ وتحويل جميع الملفات وإرسال الإيميل..."):
                         _, msg = execute_submission_transfer(src_files, src_id, dst_id)
                         st.session_state.inspection_data_tab2 = None
                         st.success(msg)
